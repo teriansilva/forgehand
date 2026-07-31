@@ -1,0 +1,158 @@
+name: Trigger Hermes PR review
+
+# Trusted reviewer trigger for the autonomous PR-review loop.
+#
+# This is the SECOND half of the split the harness documents in docs/
+# reviewer-bot.md ("Triggering the reviewer safely"):
+#
+#   - .forgejo/workflows/pr-validate.yml  — runs on `pull_request`, checks out PR-head
+#     code, holds NO secrets. It is the unsafe context.
+#   - THIS workflow                       — runs on `workflow_run`, on the TRUSTED
+#     default branch, holds HERMES_WEBHOOK_SECRET. It is the safe context.
+#
+# `workflow_run` jobs execute against the base branch's copy of the workflow YAML
+# (the version trusted by maintainers), never the PR head's. Forgejo's `workflow_run`
+# event exposes the upstream run's id/head_sha/conclusion in the event context; we
+# then fetch the ORIGINAL PR event payload from the trusted Forgejo REST API (using
+# the bot's own PAT, not PR-controlled input) and re-emit it to the Hermes PR-review
+# route via bin/reviewer-trigger, which HMACs it with HERMES_WEBHOOK_SECRET and POSTs.
+#
+# Why not just put the trigger in pr-validate.yml? See the SECURITY header there:
+# a `pull_request` job runs PR-head YAML + scripts, so exporting any secret into
+# it hands that secret to attacker-controlled code — the "pwn request". This split
+# is what keeps the secret out of the PR-controlled path.
+#
+# Auth: an org-level Forgejo PAT (INFRABOT_FORGEJO_TOKEN, cascades to all repos in
+# the superstatus.io org) with read scope is needed to fetch the event payload +
+# PR state from the Forgejo REST API. `bin/reviewer-trigger` needs
+# REVIEWER_WEBHOOK_URL + REVIEWER_WEBHOOK_SECRET (= the org HERMES_WEBHOOK_SECRET,
+# also cascading). Both org secrets already exist and are shared with infra-docs,
+# so no repo-local secrets are required.
+
+on:
+  workflow_run:
+    workflows: [pr-validate]
+    types: [completed]
+
+concurrency:
+  # One in-flight trigger per (repo, PR, head sha) so a flappy reopen can't
+  # double-fire a review. key on the head SHA so a new push supersedes staleness.
+  group: hermes-review-${{ github.repository }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  notify-reviewer:
+    runs-on: self-hosted
+    env:
+      GIT_PAGER: cat
+      FORGE_HOST: git.superstatus.io
+    steps:
+      - name: Checkout this repo (trusted default branch)
+        # Checkout the default branch, NOT the PR head — this workflow file is the
+        # trusted artifact and must be read from `main`. A `workflow_run` trigger
+        # fires on the default branch's workflow, so actions/checkout@v4 (which
+        # checks out the event's default-branch ref) gives us the trusted copy of
+        # bin/reviewer-trigger + this workflow. We do NOT need the PR-head tree
+        # here — reviewer-trigger only needs the re-signed event payload, which we
+        # fetch separately from the API.
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Resolve the triggering run
+        id: run
+        env:
+          # INFRABOT_FORGEJO_TOKEN is an org secret (cascades to all repos in the
+          # superstatus.io org). Read-only Forgejo PAT for fetching run metadata +
+          # the original PR event_payload + live PR state.
+          GH: ${{ secrets.INFRABOT_FORGEJO_TOKEN }}
+        run: |
+          set -euo pipefail
+          WR_ID="${{ github.event.workflow_run.id }}"
+          [ -n "${WR_ID}" ] || { echo "::error::workflow_run id is empty — cannot resolve the triggering run"; exit 1; }
+          RUN_JSON="$(curl -fsS -u "infrabot:${GH}" \
+            "https://${FORGE_HOST}/api/v1/repos/${{ github.repository }}/actions/runs/${WR_ID}")"
+          # Guard: only fire when the upstream validation actually PASSED.
+          STATUS="$(printf '%s' "${RUN_JSON}" | jq -r '.status')"
+          CONCLUSION="$(printf '%s' "${RUN_JSON}" | jq -r '.conclusion // "null"')"
+          if [ "${STATUS}" != "success" ]; then
+            echo "::notice::Upstream pr-validate run is not 'success' (status=${STATUS}, conclusion=${CONCLUSION}) — skipping reviewer trigger."
+            exit 0
+          fi
+          # Re-derive the four fields the reviewer-trigger / prompt need.
+          # event_payload is the ORIGINAL pull_request event Forgejo stashed on
+          # the run record — fetch it from the trusted API rather than trusting
+          # anything PR-controlled.
+          HEAD_SHA="$(printf '%s' "${RUN_JSON}" | jq -r '.commit_sha')"
+          PR_ACTION="$(printf '%s' "${RUN_JSON}" | jq -r '.event_payload | fromjson | .action')"
+          PR_NUM="$(printf '%s' "${RUN_JSON}" | jq -r '.event_payload | fromjson | .pull_request.number // empty')"
+          # Write the ORIGINAL event payload (parsed from its JSON-string wrapper)
+          # to a temp file for reviewer-trigger (it reads EVENT_PATH). Forgejo's API
+          # returns event_payload as a JSON-encoded *string*, so `| fromjson` is
+          # required to get a real object — otherwise the file would be a quoted
+          # string literal, not a parseable payload.
+          EVENT_FILE="$(mktemp)"
+          printf '%s' "${RUN_JSON}" | jq '.event_payload | fromjson' > "${EVENT_FILE}"
+          SIZE=$(wc -c < "${EVENT_FILE}")
+          if [ "${SIZE}" -lt 50 ] || ! jq -e '.pull_request.number' "${EVENT_FILE}" >/dev/null 2>&1; then
+            echo "::error::event_payload is missing, not a JSON object, or lacks pull_request (got ${SIZE} bytes) — refusing to fire on empty/garbage payload."
+            rm -f "${EVENT_FILE}"
+            exit 1
+          fi
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pr_action=${PR_ACTION}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "event_file=${EVENT_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Upstream pr-validate run ${WR_ID} succeeded — resolving review trigger for PR #${PR_NUM} @ ${HEAD_SHA:0:12} (action=${PR_ACTION})."
+
+      - name: Fetch live PR state (defence in depth)
+        id: prstate
+        env:
+          GH: ${{ secrets.INFRABOT_FORGEJO_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ steps.run.outputs.pr_number }}"
+          HEAD_SHA="${{ steps.run.outputs.head_sha }}"
+          [ -n "${PR_NUMBER}" ] || { echo "::error::no PR number resolved"; exit 1; }
+          PR_JSON="$(curl -fsS -u "infrabot:${GH}" \
+            "https://${FORGE_HOST}/api/v1/repos/${{ github.repository }}/pulls/${PR_NUMBER}")"
+          LIVE_SHA="$(printf '%s' "${PR_JSON}" | jq -r '.head.sha')"
+          LIVE_STATE="$(printf '%s' "${PR_JSON}" | jq -r '.state')"
+          if [ "${LIVE_SHA}" != "${HEAD_SHA}" ]; then
+            echo "::notice::PR #${PR_NUMBER} head has moved since the validated run (${HEAD_SHA:0:12} -> ${LIVE_SHA:0:12}) — skipping (Hermes will review the newer push via its own re-trigger)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${LIVE_STATE}" != "open" ]; then
+            echo "::notice::PR #${PR_NUMBER} is no longer open (state=${LIVE_STATE}) — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+      - name: Trigger Hermes review
+        if: steps.prstate.outputs.skip != 'true'
+        # Re-signs the original event payload and POSTs it to the Hermes PR-review
+        # route. Reads the reviewer secret from the environment (never argv); the
+        # EVENT_PATH points at the payload file written by the previous step.
+        env:
+          REVIEWER_WEBHOOK_URL: https://aiassist.superstatus.io/webhooks/forgejo-superstatus-pr-review
+          REVIEWER_WEBHOOK_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          PR_NUMBER: ${{ steps.run.outputs.pr_number }}
+          PR_HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          PR_ACTION: ${{ steps.run.outputs.pr_action }}
+          EVENT_PATH: ${{ steps.run.outputs.event_file }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REVIEWER_WEBHOOK_SECRET:-}" ]; then
+            echo "::warning::HERMES_WEBHOOK_SECRET is unset on this repo/runner — Hermes trigger skipped. Set the secret to enable PR reviews."
+            exit 0
+          fi
+          bin/reviewer-trigger
+          echo "Hermes notified: pr=#${PR_NUMBER} sha=${PR_HEAD_SHA:0:12} action=${PR_ACTION}"
+
+      - name: Clean up event payload file
+        if: always()
+        run: |
+          rm -f "${{ steps.run.outputs.event_file }}" 2>/dev/null || true

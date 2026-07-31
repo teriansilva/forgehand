@@ -1,0 +1,264 @@
+# Sync the canonical workflow doc to every org repo.
+#
+# Install as .forgejo/workflows/sync-canonical-docs.yml in your CANONICAL repo
+# (the one that owns docs/agent-workflow.md as source of truth). When the
+# canonical file changes on `main`, this mirrors it into every target repo by
+# opening a PR on each — which your AI reviewer then reviews and your agents
+# auto-merge like any other PR. Per-repo copies are never edited directly.
+#
+# Adapt before use:
+#   - FORGE_HOST below (your Forgejo host)
+#   - the matrix target list (every repo that should receive the doc)
+#   - the source path if your canonical doc lives elsewhere
+#   - secrets.FORGE_BOT_TOKEN — an org secret holding the automation bot's PAT
+#     (write access on all targets)
+#
+# Trigger model:
+#   - `push` to main touching the canonical file → real run, opens PRs.
+#   - `workflow_dispatch` with `dry_run: true` → log-only smoke test (no PRs).
+# The PR webhook is intentionally NOT a trigger — running this on each PR to
+# the canonical repo would create churn during review.
+
+name: Sync canonical docs to org repos
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/agent-workflow.md
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — log what would change, do not open PRs.'
+        type: boolean
+        default: false
+
+# TRUSTED workflow: it wields FORGE_BOT_TOKEN. Run it on the trusted runner
+# pool that never executes PR-head code — not the disposable pool used by the
+# `pull_request` validation gate. See docs/reviewer-bot.md "Runner isolation".
+concurrency:
+  group: sync-canonical-docs
+  cancel-in-progress: false
+
+env:
+  FORGE_HOST: git.example.com
+  ORG: acme
+
+jobs:
+  sync:
+    runs-on: self-hosted
+    # GIT_PAGER=cat: defence against the classic "terminal is not fully
+    # functional" pager hang — git output commands try to invoke `less` when
+    # stdout looks like a TTY, and under a runner that wait can be indefinite.
+    env:
+      GIT_PAGER: cat
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - repo-a
+          - repo-b
+          - repo-c
+    steps:
+      - name: Checkout canonical repo (source)
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 2
+
+      - name: Compute source SHA
+        id: src
+        working-directory: source
+        run: |
+          set -euo pipefail
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Clone target ${{ matrix.target }}
+        env:
+          BOT_TOKEN: ${{ secrets.FORGE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::error::FORGE_BOT_TOKEN org secret is unset. Set it to a PAT owned by the automation bot with write access on all targets."
+            exit 1
+          fi
+          # Auth via a credential helper that reads the token from the
+          # ENVIRONMENT at invocation time — the config stores only the literal
+          # string "${BOT_TOKEN}" (git expands it when it runs the helper), so
+          # the PAT is never on a command line (invisible to `ps` / /proc) and,
+          # because the clone URL carries no credentials, never persisted into
+          # target/.git/config.
+          #
+          # The helper is written to a JOB-SCOPED temp GIT_CONFIG_GLOBAL (not
+          # the runner's real ~/.gitconfig): on a persistent self-hosted runner
+          # a global write would survive the job, race with parallel matrix
+          # jobs, and — if unscoped — answer credential requests for unrelated
+          # hosts. It is also HOST-SCOPED to the Forgejo host so it can never
+          # hand the bot PAT to any other remote. Exported via $GITHUB_ENV so
+          # the later push step reuses it; a final always() step deletes it.
+          GC="$(mktemp)"; chmod 600 "$GC"
+          git config --file "$GC" \
+            "credential.https://${FORGE_HOST}.helper" \
+            '!f() { test "$1" = get && printf "username=forge-bot\npassword=%s\n" "${BOT_TOKEN}"; }; f'
+          echo "GIT_CONFIG_GLOBAL=$GC" >> "$GITHUB_ENV"
+          export GIT_CONFIG_GLOBAL="$GC" GIT_TERMINAL_PROMPT=0
+          # Remove any `target/` left by a previous run on a persistent
+          # workspace — `git clone` refuses to write into an existing dir, so a
+          # rerun would fail here. (The always() cleanup step also removes it,
+          # but a run that was killed before cleanup can still leave it behind.)
+          rm -rf target
+          git clone --depth=1 \
+            "https://${FORGE_HOST}/${ORG}/${{ matrix.target }}.git" target
+          # Belt and braces: confirm no credential leaked into the remote URL.
+          case "$(git -C target remote get-url origin)" in
+            *@*) echo "::error::credentials leaked into target/.git/config remote"; exit 1 ;;
+          esac
+
+      - name: Copy canonical file into target with sync header
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.src.outputs.sha_short }}'
+          mkdir -p target/docs
+          {
+            echo "<!-- SYNCED — do not edit directly. Source: canonical repo docs/agent-workflow.md @ ${SHA} -->"
+            echo
+            cat source/docs/agent-workflow.md
+          } > target/docs/agent-workflow.md
+
+      - name: Check for diff
+        id: diff
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # Stage first: `git diff --cached --quiet` exits 0 only when NOTHING
+          # changed — covering brand-new (untracked) files and modifications
+          # uniformly. (A bare `git diff --quiet <path>` reports 0 for an
+          # untracked file, which would misclassify a first-time sync.)
+          git add docs/agent-workflow.md
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes for ${{ matrix.target }} — already in sync."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff --cached --stat || true
+          fi
+
+      - name: Dry-run summary
+        if: steps.diff.outputs.changed == 'true' && inputs.dry_run == true
+        working-directory: target
+        run: |
+          set -euo pipefail
+          echo "::notice::Dry run — would open PR on ${{ matrix.target }} with:"
+          # `sed -n '1,80p'` reads the whole stream, so `git diff` never gets
+          # SIGPIPE from an early-closing `head` (which would exit 141 under
+          # `set -o pipefail` on a large diff).
+          git --no-pager diff --cached | sed -n '1,80p'
+
+      - name: Open sync PR on ${{ matrix.target }}
+        if: steps.diff.outputs.changed == 'true' && inputs.dry_run != true
+        working-directory: target
+        env:
+          BOT_TOKEN: ${{ secrets.FORGE_BOT_TOKEN }}
+          SRC_SHA: ${{ steps.src.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+          git config user.name forge-bot
+          git config user.email "forge-bot@noreply.${FORGE_HOST}"
+
+          auth_cfg() { printf 'header = "Authorization: token %s"\n' "${BOT_TOKEN}"; }
+
+          # DETERMINISTIC branch keyed on the source SHA — one branch + one PR
+          # per canonical revision. A rerun, a retry after a lost API response,
+          # or a queued re-push must CONVERGE on that single PR, not spawn a
+          # timestamped duplicate + orphan branch. So: if an open sync PR for
+          # this source SHA already exists, we're done; otherwise reuse/refresh
+          # the deterministic branch (force-with-lease) and open exactly one PR.
+          BRANCH="agent/sync-canonical-docs-${SRC_SHA}"
+
+          EXISTING=$(auth_cfg | curl -fsS -K - \
+            "https://${FORGE_HOST}/api/v1/repos/${ORG}/${{ matrix.target }}/pulls?state=open&limit=50" \
+            | jq -r --arg b "${BRANCH}" 'map(select(.head.ref == $b)) | (.[0].number // empty)')
+          if [ -n "${EXISTING:-}" ]; then
+            echo "::notice::open sync PR #${EXISTING} for ${SRC_SHA} already exists on ${{ matrix.target }} — converging, not duplicating."
+            exit 0
+          fi
+
+          git checkout -B "${BRANCH}"
+          git add docs/agent-workflow.md
+          git commit -m "chore: sync canonical workflow doc @${SRC_SHA}"
+          # Reconcile against the LIVE remote ref before pushing. This is a
+          # shallow clone, so there is no remote-tracking ref for an existing
+          # ${BRANCH}; a plain `--force-with-lease` would reject with "stale
+          # info" for a branch a prior run pushed but never PR'd. Read the
+          # remote head directly and pass it as the explicit lease expectation
+          # (empty when the branch doesn't exist yet → a plain create push).
+          REMOTE_SHA=$(git ls-remote --heads origin "${BRANCH}" | awk '{print $1}')
+          if [ -n "${REMOTE_SHA}" ]; then
+            git push --force-with-lease="${BRANCH}:${REMOTE_SHA}" origin "${BRANCH}"
+          else
+            git push origin "${BRANCH}"
+          fi
+
+          PR_BODY=$(printf '%s\n' \
+            "Automated sync of the canonical workflow doc @ ${SRC_SHA}:" \
+            "" \
+            "- \`docs/agent-workflow.md\` ← canonical repo" \
+            "" \
+            "The canonical source of truth lives in the canonical repo; this PR mirrors" \
+            "the change into this repo. The AI reviewer will review; mechanical sync PRs" \
+            "auto-merge per workflow §8.")
+          PAYLOAD=$(jq -n \
+            --arg head "${BRANCH}" --arg base main \
+            --arg title "chore: sync canonical workflow doc @${SRC_SHA}" \
+            --arg body "${PR_BODY}" \
+            '{head: $head, base: $base, title: $title, body: $body}')
+
+          # auth_cfg (defined above) feeds curl its Authorization header via a
+          # --config snippet on stdin (-K -), never on argv, so the token can't
+          # be read from `ps` / /proc. (`bin/agentwork` uses the same pattern.)
+          PR_JSON=$(auth_cfg | curl -fsS -X POST -K - \
+            -H "Content-Type: application/json" \
+            "https://${FORGE_HOST}/api/v1/repos/${ORG}/${{ matrix.target }}/pulls" \
+            -d "${PAYLOAD}")
+          PR_NUMBER=$(printf '%s' "${PR_JSON}" | jq -r '.number')
+          printf '%s' "${PR_JSON}" | jq -r '"Opened PR #\(.number): \(.html_url)"'
+
+          # Label the sync PR so it satisfies the one type:* + >=1 area:* rule the
+          # synced doc itself publishes. Label NAMES vary per repo, so resolve IDs
+          # from the live label set — prefer apt names, fall back by prefix. Never
+          # fail the sync over a labelling miss.
+          LABELS_JSON=$(auth_cfg | curl -fsS -K - \
+            "https://${FORGE_HOST}/api/v1/repos/${ORG}/${{ matrix.target }}/labels?limit=100")
+          TYPE_ID=$(printf '%s' "${LABELS_JSON}" | jq -r '
+            . as $l
+            | first(
+                (["type:docs","docs"][] as $n | $l[] | select(.name==$n) | .id),
+                ($l[] | select(.name|startswith("type:")) | .id)
+              ) // empty')
+          AREA_ID=$(printf '%s' "${LABELS_JSON}" | jq -r '
+            . as $l
+            | first(
+                (["area:docs","area:meta","area:infra"][] as $n | $l[] | select(.name==$n) | .id),
+                ($l[] | select(.name|startswith("area:")) | .id)
+              ) // empty')
+          LABEL_IDS=$(jq -nc --arg t "${TYPE_ID}" --arg a "${AREA_ID}" \
+            '[$t, $a] | map(select(. != "")) | map(tonumber)')
+          if [ "${LABEL_IDS}" != "[]" ]; then
+            auth_cfg | curl -fsS -X POST -K - \
+              -H "Content-Type: application/json" \
+              "https://${FORGE_HOST}/api/v1/repos/${ORG}/${{ matrix.target }}/issues/${PR_NUMBER}/labels" \
+              -d "{\"labels\": ${LABEL_IDS}}" >/dev/null \
+              && echo "Labeled PR #${PR_NUMBER}"
+          else
+            echo "::warning::No type/area labels resolved on ${{ matrix.target }}; PR #${PR_NUMBER} left unlabeled"
+          fi
+
+      - name: Clean up job artifacts on the runner
+        # Always remove the temp GIT_CONFIG_GLOBAL (so no credential-helper
+        # config lingers on a persistent self-hosted runner) and the `target`
+        # clone (which `actions/checkout` does not manage, and whose presence
+        # would break the next run's `git clone … target`).
+        if: always()
+        run: |
+          rm -f "${GIT_CONFIG_GLOBAL:-}" || true
+          rm -rf target || true

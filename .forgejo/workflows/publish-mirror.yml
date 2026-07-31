@@ -1,0 +1,160 @@
+name: Publish to GitH mirror
+
+# Mirror this repo to github.com/teriansilva/forgehand.
+#
+# Triggers:
+#   * push to main  → sync the new main to the GitH mirror's main.
+#   * push of a v* tag → push that tag + mirror release notes.
+#   * workflow_dispatch → manual re-sync of whatever ref the runner checks out.
+#
+# forgehand is a public release artifact — everything here is meant for public
+# consumption, so this is a TRUE mirror (full tree), not the filtered flat-snapshot
+# pattern the private SuperStatus repo uses. If internal-only paths ever land in
+# this repo, adopt the `git archive` + leak-guard step from the SuperStatus publish
+# workflow.
+#
+# Auth: the self-hosted runner (mb-infrabot) is logged in to GitH via `gh` as the
+# mirror owner (teriansilva). We pin HOME + GH_CONFIG_DIR so the job finds the host's
+# gh keyring login, then read the token at runtime via `gh auth token` and export it
+# to GH_TOKEN (which git+gh consume automatically). No PAT is stored in the workflow
+# or gitconfig — the token is fetched from the host keyring at push time. The optional
+# GH_PUBLISH_TOKEN secret pins an explicit PAT instead of the host login.
+#
+# Security: triggers on `push` / `workflow_dispatch` only — both fire on the TRUSTED
+# default branch, never on PR-head code. Safe to hold GitH credentials here.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Serialize publishes so a release (tag + main) can't race the same public repo.
+concurrency:
+  group: publish-mirror
+  cancel-in-progress: false
+
+env:
+  PUBLIC_REPO: https://github.com/teriansilva/forgehand.git
+  GH_REPO: teriansilva/forgehand
+  FORGE_HOST: git.superstatus.io
+  FORGE_REPO: superstatus.io/forgehand
+  FORGEJO_API: https://git.superstatus.io/api/v1/repos/superstatus.io/forgehand
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    env:
+      PATH: /home/marcusbraun/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Pin HOME + GH_CONFIG_DIR so gh/git find the host keyring login.
+      # The Forgejo runner may assign a clean HOME for the job.
+      HOME: /home/marcusbraun
+      GH_CONFIG_DIR: /home/marcusbraun/.config/gh
+    steps:
+      - name: Checkout the ref being published
+        # Manual clone — actions/checkout@v4 is incompatible with the host runner
+        # (see .forgejo/workflows/pr-validate.yml header note on runner setup).
+        env:
+          REPO_URL: https://git.superstatus.io/superstatus.io/forgehand.git
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "${REPO_URL}"
+          git fetch --depth=1 origin "${REF}"
+          git checkout -q FETCH_HEAD
+          echo "Checked out ${REF}: $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
+
+      - name: Configure GitH auth
+        # Forgejo Actions may inject GITHUB_TOKEN (an Actions token), which gh
+        # prefers over the host keyring login and fails against github.com.
+        # Unset it, then read the host gh login token (from GH_CONFIG_DIR) into
+        # GH_TOKEN via GITHUB_ENV so the push steps inherit it. `gh auth token`
+        # reads the keyring at runtime — no PAT is stored in the workflow or
+        # gitconfig.
+        run: |
+          set -euo pipefail
+          unset GITHUB_TOKEN
+          TOKEN="$(gh auth token -h github.com 2>/dev/null || gh auth token 2>/dev/null)"
+          if [ -z "${TOKEN}" ]; then
+            echo "::warning::GitH not authenticated (runner gh not logged in) — mirror sync SKIPPED." >&2
+            exit 0
+          fi
+          echo "GH_TOKEN=${TOKEN}" >> "$GITHUB_ENV"
+          echo "GitH auth configured."
+
+      - name: Publish branch (main) to GitH mirror
+        # Flat single-commit snapshot: one "publish: sync to <sha>" commit per
+        # Forgejo push. Keeps the GitH history linear and decoupled from the
+        # Forgejo commit graph. `git archive` builds the tree in a temp dir so the
+        # copy is an exact tree export, not a path-dependent cp. Force-push is
+        # intentional: the mirror's main is a generated artifact, always
+        # overwritten from Forgejo.
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cd "${WORKSPACE}"
+          SHA="$(git rev-parse HEAD)"
+          SHA_SHORT="${SHA:0:12}"
+          OUT="$(mktemp -d)"
+          git archive --format=tar HEAD | tar -x -C "${OUT}"
+          echo "Snapshot of ${SHA_SHORT} built ($(find "${OUT}" -type f | wc -l) files)."
+          git init -q "${OUT}" && cd "${OUT}"
+          git config user.name "forgehand-publish"
+          git config user.email "publish@superstatus.io"
+          git branch -M main
+          git remote add origin "${PUBLIC_REPO}"
+          git add -A
+          git commit -q -m "publish: sync to ${SHA_SHORT}" || echo "nothing to commit"
+          GIT_TERMINAL_PROMPT=0 git push -f origin main
+          echo "Published flat snapshot of ${SHA_SHORT} to github.com/${GH_REPO} (main)."
+
+      - name: Publish tag + release to GitH mirror
+        # Push the tag to the GitH mirror, then mirror the Forgejo release notes
+        # onto the GitH release (creating or updating it). Retry the notes fetch:
+        # the Forgejo create-release webhook may publish notes a few seconds after
+        # the tag push that triggered this run, so poll briefly.
+        #
+        # SECURITY: forgehand is a PUBLIC repo, so the release-notes API endpoint
+        # is unauthenticated — we use curl with NO Authorization header (no env
+        # var, no token on argv, no printf|curl -K pattern). This sidesteps the
+        # argv-token concern Hermes flagged in review: there is no secret to leak
+        # because the GET is public.
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          # Clone the existing mirror (or start fresh on first publish).
+          git clone --depth=1 "${PUBLIC_REPO}" "${WORK}" 2>/dev/null || git init -q "${WORK}"
+          cd "${WORK}"
+          # Fetch the tag from the PUBLIC Forgejo repo (no auth needed).
+          git fetch --depth=1 "https://${FORGE_HOST}/${FORGE_REPO}.git" "${TAG}"
+          git tag -f "${TAG}"
+          GIT_TERMINAL_PROMPT=0 git push origin "refs/tags/${TAG}"
+          echo "Pushed tag ${TAG} to github.com/${GH_REPO}."
+
+          # Fetch Forgejo release notes. forgehand is public → the API GET is
+          # unauthenticated, so there is no secret to place on argv. (If this repo
+          # ever goes private, switch to the gh api / keyring pattern — at which
+          # point the env-only discipline from bin/reviewer-trigger applies.)
+          NF="${RUNNER_TEMP:-/tmp}/notes-${TAG}.md"
+          : > "${NF}"
+          for i in 1 2 3 4 5; do
+            BODY="$(curl -fsS --max-time 15 \
+              "${FORGEJO_API}/releases/tags/${TAG}" 2>/dev/null \
+              | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin).get("body","") or "")' 2>/dev/null || true)"
+            if [ -n "${BODY}" ]; then printf '%s' "${BODY}" > "${NF}"; break; fi
+            sleep 3
+          done
+          [ -s "${NF}" ] || printf 'forgehand %s\n' "${TAG}" > "${NF}"
+          if gh release view "${TAG}" -R "${GH_REPO}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" -R "${GH_REPO}" --title "forgehand ${TAG}" --notes-file "${NF}"
+            echo "Updated GitH release ${TAG}."
+          else
+            gh release create "${TAG}" -R "${GH_REPO}" --title "forgehand ${TAG}" --notes-file "${NF}"
+            echo "Created GitH release ${TAG}."
+          fi

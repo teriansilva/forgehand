@@ -1,0 +1,148 @@
+# Nightly maintenance audit — reference template.
+#
+# Runs a read-only LLM auditor against the repo it lives in and upserts ONE
+# findings issue as the automation bot, which the AI reviewer then reviews.
+# The heavy logic (context gathering, model call, issue upsert, guarded
+# auto-close) lives in a HOST-side wrapper script this repo does NOT ship —
+# the analyzer's exact input/output contract is documented in
+# prompts/nightly-audit.md; the wrapper is a few hundred lines of glue you
+# write against it (clone repo → collect tree + key files + open issues →
+# run model on the prompt → parse the single JSON block → upsert issue).
+#
+# Safety posture (enforce these in the wrapper, not the model):
+#   - dry_run defaults TRUE on manual dispatch; a dispatch must opt out to write.
+#   - auto_close defaults FALSE (recommend-only) until the per-repo
+#     false-positive rate is known; when on, only issues referenced by a
+#     MERGED PR are ever closed.
+#   - malformed/empty model output is fail-closed: no issue is created/overwritten.
+#
+# Cascade this file into each target repo (see sync-canonical-docs.yml for the
+# pattern); on its nightly schedule it audits the repo it lives in. Stagger the
+# cron minute per repo so a shared runner isn't hit by every repo at once.
+
+name: Nightly maintenance audit
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Target repo owner/name (default: this repo). Use to pilot another repo.'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Dry run — analyse + print the rendered issue, write nothing.'
+        type: boolean
+        default: true
+      auto_close:
+        description: 'Enable guarded auto-close of merged-PR-referenced issues.'
+        type: boolean
+        default: false
+      model:
+        description: 'Model for the analyzer (provider/model).'
+        type: string
+        default: 'local/your-model'
+
+# TRUSTED workflow: it hands FORGE_BOT_TOKEN to the host wrapper. Run it on the
+# trusted runner pool that never executes PR-head code — not the disposable
+# pool used by the `pull_request` gate. See docs/reviewer-bot.md "Runner isolation".
+concurrency:
+  group: nightly-audit-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: self-hosted
+    timeout-minutes: 45
+    env:
+      GIT_PAGER: cat
+      # The org the bot token belongs to. A dispatch MUST NOT be able to point
+      # the org-scoped token at a repo outside this org (see the org-enforcement
+      # check in "Resolve run parameters"). Optionally tighten to an explicit
+      # repo allowlist for stricter control.
+      ORG: acme
+    steps:
+      - name: Preflight — must be the audit host
+        run: |
+          set -euo pipefail
+          # Host-mode jobs often run with a shell PATH that omits ~/.local/bin;
+          # put the wrapper's home on PATH for this and every later step.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v nightly-audit >/dev/null 2>&1; then
+            echo "::error::nightly-audit wrapper not found on PATH — this runner is not the audit host, or the host tooling is not installed. Aborting."
+            exit 1
+          fi
+
+      - name: Resolve run parameters
+        id: params
+        # Dispatch inputs reach the shell ONLY as env values — `${{ }}` inside
+        # `run:` is substituted into shell source by the runner, so a crafted
+        # input could otherwise inject commands on the self-hosted host.
+        env:
+          IN_REPO: ${{ inputs.repo }}
+          IN_MODEL: ${{ inputs.model }}
+          IN_DRY: ${{ inputs.dry_run }}
+          IN_AC: ${{ inputs.auto_close }}
+          EVENT_NAME: ${{ github.event_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # schedule events have no inputs → safe defaults (the scheduled
+          # nightly run writes the issue; auto-close stays off).
+          TARGET="${IN_REPO:-$THIS_REPO}"
+          DRY='false'
+          AC='false'
+          MODEL='local/your-model'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DRY="$IN_DRY"
+            AC="$IN_AC"
+            [ -n "$IN_MODEL" ] && MODEL="$IN_MODEL"
+          fi
+          # Allowlist-validate every value that later reaches argv/$GITHUB_OUTPUT.
+          # Must be [[ =~ ]] (whole-string anchors), NOT grep: grep matches per
+          # LINE, so a multiline input with one valid line could smuggle extra
+          # key=value lines into $GITHUB_OUTPUT. The character classes admit no
+          # \r/\n, so a match guarantees a single-line value.
+          if ! [[ "$TARGET" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::invalid repo input (want owner/name)"; exit 1
+          fi
+          # Enforce the configured org: the next step hands the org-scoped bot
+          # token to the wrapper for TARGET, so a dispatcher must not be able to
+          # redirect the bot at a repo in another org that the token can reach.
+          if [ "${TARGET%%/*}" != "${ORG}" ]; then
+            echo "::error::target '$TARGET' is outside the configured org '${ORG}' — refusing to point the org token elsewhere"; exit 1
+          fi
+          if ! [[ "$MODEL" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+$ ]]; then
+            echo "::error::invalid model input (want provider/model)"; exit 1
+          fi
+          case "$DRY" in true|false) ;; *) echo "::error::invalid dry_run input"; exit 1 ;; esac
+          case "$AC"  in true|false) ;; *) echo "::error::invalid auto_close input"; exit 1 ;; esac
+          {
+            echo "target=$TARGET"
+            echo "model=$MODEL"
+            echo "dry=$DRY"
+            echo "ac=$AC"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::nightly-audit target=$TARGET dry_run=$DRY auto_close=$AC model=$MODEL"
+
+      - name: Run audit
+        # Step outputs are passed via env (not `${{ }}`-in-run) even though
+        # they are allowlist-validated above — defence in depth.
+        env:
+          BOT_TOKEN: ${{ secrets.FORGE_BOT_TOKEN }}
+          TARGET: ${{ steps.params.outputs.target }}
+          MODEL: ${{ steps.params.outputs.model }}
+          DRY: ${{ steps.params.outputs.dry }}
+          AC: ${{ steps.params.outputs.ac }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::error::FORGE_BOT_TOKEN org secret is unset."; exit 1
+          fi
+          FLAGS=()
+          if [ "$DRY" = "true" ]; then FLAGS+=(--dry-run); else FLAGS+=(--no-dry-run); fi
+          if [ "$AC" = "true" ]; then FLAGS+=(--auto-close); fi
+          nightly-audit --repo "$TARGET" --model "$MODEL" "${FLAGS[@]}"

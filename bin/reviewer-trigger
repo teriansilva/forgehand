@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# reviewer-trigger — re-emit a validated PR webhook event to the AI reviewer.
+#
+# The reviewer is gated on validation: it is not subscribed to raw PR events,
+# so this re-signed re-emit is what wakes it once a PR's checks go green.
+#
+# ⚠️  RUN THIS FROM A TRUSTED CONTEXT ONLY — a status-webhook subscriber or a
+# host-side dispatcher that the PR author cannot modify. Do NOT call it from a
+# `pull_request`-triggered CI job: that job runs PR-head code, so exporting the
+# reviewer secret into it would hand the secret to attacker-controlled code
+# (the "pwn request" pattern). See docs/reviewer-bot.md.
+#
+# The HMAC key is read from the environment (never passed on the command line,
+# so it can't be read from `ps` / /proc/<pid>/cmdline).
+#
+# Env:
+#   REVIEWER_WEBHOOK_URL     the reviewer route to POST the event to
+#   REVIEWER_WEBHOOK_SECRET  HMAC key the reviewer expects (sha256 signature)
+#   REVIEWER_LOGIN           reviewer bot login (sender-restore fix, optional)
+#   EVENT_PATH               path to the original event payload JSON
+#                            (defaults to $GITHUB_EVENT_PATH)
+#   PR_NUMBER PR_HEAD_SHA PR_ACTION RUN_ID   metadata for delivery id / event type
+#
+# Behavior contract (exercised by CI smoke tests):
+#   - URL or secret unset  → print a skip notice, exit 0
+#   - event payload absent → exit 1 (misconfiguration must be loud)
+#   - otherwise POST the re-signed payload; non-2xx from the reviewer → exit 1
+set -euo pipefail
+
+EVENT_PATH="${EVENT_PATH:-${GITHUB_EVENT_PATH:-}}"
+
+if [ -z "${REVIEWER_WEBHOOK_URL:-}" ] || [ -z "${REVIEWER_WEBHOOK_SECRET:-}" ]; then
+  echo "reviewer-trigger: reviewer secrets unset — skipping (validation stays green)."
+  exit 0
+fi
+if [ -z "${EVENT_PATH}" ] || [ ! -f "${EVENT_PATH}" ]; then
+  echo "reviewer-trigger: no event payload at '${EVENT_PATH:-<unset>}'" >&2
+  exit 1
+fi
+
+case "${PR_ACTION:-}" in
+  synchronize) EVENT_TYPE=pull_request_sync ;;
+  *)           EVENT_TYPE=pull_request ;;
+esac
+
+# Forgejo emits `synchronize` events with sender.login set to the PR's
+# most-recent reviewer rather than the actual pusher, which would make the
+# reviewer's self-loop guard short-circuit re-reviews after its first vote.
+# Restore sender to the PR opener — but only when the opener is not the
+# reviewer itself, preserving the self-loop guard for genuine reviewer pushes.
+BODY="$(jq -c --arg rb "${REVIEWER_LOGIN:-}" '
+          if $rb != "" and (.sender.login // "") == $rb
+             and (.pull_request.user.login // "") != $rb
+          then .sender = .pull_request.user
+          else . end' "${EVENT_PATH}")"
+
+# HMAC the body with the key read from the environment (NOT argv). The
+# signature itself is not secret; only the key is, and it never leaves the
+# process environment. We require python3 rather than `openssl dgst -hmac`
+# precisely because the openssl form would place the key on the command line,
+# where `ps` / /proc/<pid>/cmdline can read it — the exact exposure this
+# helper exists to avoid. python3 is already required elsewhere in the harness.
+command -v python3 >/dev/null 2>&1 || {
+  echo "reviewer-trigger: python3 is required (HMAC key must be kept off argv)" >&2
+  exit 1
+}
+SIG="$(BODY="${BODY}" REVIEWER_WEBHOOK_SECRET="${REVIEWER_WEBHOOK_SECRET}" python3 -c \
+  'import os,hmac,hashlib; print(hmac.new(os.environ["REVIEWER_WEBHOOK_SECRET"].encode(), os.environ["BODY"].encode(), hashlib.sha256).hexdigest())')"
+DELIVERY="pr-validate-${PR_NUMBER:-0}-$(printf '%s' "${PR_HEAD_SHA:-none}" | cut -c1-12)-${RUN_ID:-$(date +%s)}"
+
+curl -fsS --max-time 15 -X POST "${REVIEWER_WEBHOOK_URL}" \
+  -H 'Content-Type: application/json' \
+  -H "X-Forgejo-Event: ${EVENT_TYPE}" \
+  -H "X-Gitea-Event: ${EVENT_TYPE}" \
+  -H "X-Forgejo-Signature: ${SIG}" \
+  -H "X-Gitea-Signature: ${SIG}" \
+  -H "X-Forgejo-Delivery: ${DELIVERY}" \
+  -H "X-GitHub-Delivery: ${DELIVERY}" \
+  --data-binary "${BODY}"
+echo "reviewer-trigger: notified event=${EVENT_TYPE} pr=#${PR_NUMBER:-?} sha=$(printf '%s' "${PR_HEAD_SHA:-?}" | cut -c1-12)"

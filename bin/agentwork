@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# agentwork — isolated per-issue checkouts for Forgejo repos.
+#
+# Each issue is worked in its own throwaway full clone under
+# $AGENTWORK_ROOT/<repo>/<slug>, removed once its PR is merged/closed. The
+# `done` / `sweep` guard enforces clean + pushed + PR merged/closed; issue
+# closure is convention, not machine-checked. See docs/agent-workflow.md §5
+# "Isolated per-issue checkouts".
+#
+# Configuration (env):
+#   FORGE_URL           https://git.example.com          (your Forgejo)
+#   FORGE_ORG           acme                             (your org)
+#   AGENTWORK_REPOS     "repo-a repo-b repo-c"           (allowlist — keeps agents inside your org)
+#   AGENTWORK_ROOT      ~/agentwork                      (scratch root; never /tmp)
+#   FORGEJO_TOKEN_FILE  ~/.config/forgejo/token          (read-only PR-state checks)
+#
+# Install:  install -m755 bin/agentwork ~/.local/bin/
+set -euo pipefail
+
+AGENTWORK_ROOT="${AGENTWORK_ROOT:-$HOME/agentwork}"
+FORGE="${FORGE_URL:-https://git.example.com}"
+ORG="${FORGE_ORG:-acme}"
+ALLOWLIST="${AGENTWORK_REPOS:-}"
+TOKEN_FILE="${FORGEJO_TOKEN_FILE:-$HOME/.config/forgejo/token}"
+
+die() { echo "agentwork: $*" >&2; exit 1; }
+
+valid_repo() { local r="$1" a; for a in $ALLOWLIST; do [ "$r" = "$a" ] && return 0; done; return 1; }
+valid_slug() {
+  # no '/', no leading dot, and no '..' anywhere (the charset alone would admit
+  # "a..b", so reject the substring explicitly — the slug becomes a path element).
+  [[ "$1" == *..* ]] && return 1
+  [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+}
+
+ensure_claude_trust() {
+  # Idempotently mark $AGENTWORK_ROOT trusted for Claude Code, preserving every
+  # other key. No-op on the second run. Best-effort: never fails the command.
+  # (Skip harmlessly if you don't use Claude Code.)
+  local cfg="$HOME/.claude.json" tmp
+  command -v jq >/dev/null 2>&1 || { echo "agentwork: jq missing; skip Claude trust" >&2; return 0; }
+  [ -f "$cfg" ] || return 0
+  if jq -e --arg p "$AGENTWORK_ROOT" '(.projects[$p].hasTrustDialogAccepted) == true' "$cfg" >/dev/null 2>&1; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  cp -f "$cfg" "$cfg.agentwork.bak"
+  if jq --arg p "$AGENTWORK_ROOT" '
+        .projects = (.projects // {})
+        | .projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true})
+      ' "$cfg" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$cfg"
+    echo "agentwork: marked $AGENTWORK_ROOT trusted for Claude Code (backup: $cfg.agentwork.bak)"
+  else
+    rm -f "$tmp"
+    echo "agentwork: WARN could not update Claude trust; do it manually if needed" >&2
+  fi
+}
+
+pr_state_for_head() {
+  # echo merged|closed|open|none for the PR whose head commit is $sha.
+  # Matching on head.sha (not head.ref) survives branch deletion on merge:
+  # Forgejo rewrites a merged+deleted PR's head.ref to refs/pull/<n>/head, so a
+  # branch-name match would miss it; the local HEAD sha stays correlatable.
+  # Window caveat: only the 50 most-recent PRs are scanned — fine for a cleanup
+  # helper that runs near merge time.
+  # The token is handed to curl via a --config snippet on stdin (-K -), never
+  # as a command-line argument, so it can't be read from `ps` or
+  # /proc/<pid>/cmdline while `done` / `sweep` runs.
+  local repo="$1" sha="$2"
+  [ -f "$TOKEN_FILE" ] || { echo "none"; return 0; }
+  curl -fsS -K - "$FORGE/api/v1/repos/$ORG/$repo/pulls?state=all&limit=50" 2>/dev/null <<EOF \
+    | jq -r --arg s "$sha" '
+        map(select(.head.sha == $s))
+        | if length == 0 then "none"
+          elif (.[0].merged) then "merged"
+          elif (.[0].state == "closed") then "closed"
+          else "open" end' 2>/dev/null || echo "none"
+header = "Authorization: token $(cat "$TOKEN_FILE")"
+EOF
+}
+
+cmd_start() {
+  local repo="$1" slug="$2" dir
+  [ -n "$ALLOWLIST" ] || die "AGENTWORK_REPOS is unset — configure the repo allowlist first"
+  valid_repo "$repo" || die "repo '$repo' not in allowlist: $ALLOWLIST"
+  valid_slug "$slug" || die "slug '$slug' invalid (must match ^[a-z0-9][a-z0-9._-]*\$; no '/' or '..')"
+  dir="$AGENTWORK_ROOT/$repo/$slug"
+  [ -e "$dir" ] && die "target already exists: $dir"
+  mkdir -p "$AGENTWORK_ROOT/$repo"
+  git clone -q "$FORGE/$ORG/$repo.git" "$dir"
+  git -C "$dir" checkout -q -b "agent/$slug" origin/main
+  ensure_claude_trust
+  echo "agentwork: ready → cd $dir   (branch agent/$slug off main)"
+  return 0
+}
+
+check_removable() {
+  # Prints a reason on stdout if NOT removable (caller treats empty = OK).
+  local repo="$1" dir="$2" remote sha st
+  remote="$(git -C "$dir" remote get-url origin 2>/dev/null || echo '')"
+  [[ "$remote" == *"$ORG/$repo"* ]] || { echo "remote mismatch ($remote)"; return; }
+  [ -z "$(git -C "$dir" status --porcelain)" ] || { echo "working tree not clean"; return; }
+  sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
+  [ -n "$sha" ] || { echo "cannot resolve HEAD"; return; }
+  # Removable only when this checkout's HEAD commit is the head of a merged or
+  # closed PR. The sha-match doubles as the "was pushed" guard: unpushed local
+  # commits match no PR head → 'none' → refused. No @{upstream} check — that
+  # branch is gone once the PR merged with branch deletion.
+  st="$(pr_state_for_head "$repo" "$sha")"
+  case "$st" in
+    merged|closed) ;;
+    open) echo "PR for HEAD ($sha) is still open"; return;;
+    *)    echo "no merged/closed PR found for HEAD ($sha) — unpushed or unmerged?"; return;;
+  esac
+  echo ""   # removable
+}
+
+cmd_done() {
+  local repo="$1" slug="$2" dir reason
+  valid_repo "$repo" || die "repo '$repo' not in allowlist"
+  valid_slug "$slug" || die "slug '$slug' invalid"
+  dir="$AGENTWORK_ROOT/$repo/$slug"
+  [ -d "$dir" ] || die "no checkout at $dir"
+  reason="$(check_removable "$repo" "$dir")"
+  [ -z "$reason" ] || die "refuse to remove $dir — $reason"
+  rm -rf "$dir"
+  echo "agentwork: removed $dir"
+}
+
+cmd_sweep() {
+  local apply=0 found=0 repo_dir repo co reason
+  [ "${1:-}" = "--yes" ] && apply=1
+  [ -d "$AGENTWORK_ROOT" ] || { echo "agentwork: nothing under $AGENTWORK_ROOT"; return 0; }
+  for repo_dir in "$AGENTWORK_ROOT"/*/; do
+    [ -d "$repo_dir" ] || continue
+    repo="$(basename "$repo_dir")"
+    valid_repo "$repo" || continue
+    for co in "$repo_dir"*/; do
+      [ -d "$co/.git" ] || continue
+      reason="$(check_removable "$repo" "${co%/}")"
+      [ -z "$reason" ] || continue
+      found=1
+      if [ "$apply" = "1" ]; then rm -rf "${co%/}"; echo "removed: ${co%/}"; else echo "would remove: ${co%/}"; fi
+    done
+  done
+  [ "$found" = "1" ] || { echo "agentwork: no removable checkouts (need clean + pushed + PR merged/closed)"; return 0; }
+  [ "$apply" = "1" ] || echo "agentwork: dry-run — pass --yes to actually remove"
+}
+
+usage() {
+  cat <<EOF
+agentwork — isolated per-issue checkouts for Forgejo repos
+
+USAGE
+  agentwork start <repo> <slug>   clone <repo> → \$AGENTWORK_ROOT/<repo>/<slug>, branch agent/<slug> off main
+  agentwork done  <repo> <slug>   verify clean + pushed + PR merged/closed, then rm -rf (refuses + reports otherwise)
+  agentwork sweep [--yes]         remove checkouts whose PR is merged/closed (dry-run unless --yes)
+  agentwork --help
+
+Forge             : $FORGE / $ORG   (override with \$FORGE_URL, \$FORGE_ORG)
+Allowlisted repos : ${ALLOWLIST:-<unset — set \$AGENTWORK_REPOS>}
+Scratch root      : $AGENTWORK_ROOT   (override with \$AGENTWORK_ROOT)
+Reference         : docs/agent-workflow.md §5
+EOF
+}
+
+case "${1:-}" in
+  start) shift; [ $# -eq 2 ] || die "usage: agentwork start <repo> <slug>"; cmd_start "$@";;
+  done)  shift; [ $# -eq 2 ] || die "usage: agentwork done <repo> <slug>";  cmd_done "$@";;
+  sweep) shift; cmd_sweep "${1:-}";;
+  -h|--help|help|"") usage;;
+  *) die "unknown command '${1}' (try --help)";;
+esac

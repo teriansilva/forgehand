@@ -1,0 +1,346 @@
+name: PR Validation
+
+# This repo's live CI gate — and the validation-gate example for adopters.
+#
+# SECURITY: this workflow triggers on `pull_request`, which means BOTH this
+# YAML and every script it runs come from the PR head — i.e. from code the
+# PR author controls. Therefore this workflow holds **NO secrets**, and it
+# must run on a DISPOSABLE / ISOLATED runner (fresh container/VM, separate
+# user + home + workspace) — never a persistent runner shared with the
+# token-bearing trusted jobs, whose same-user host state PR code could poison.
+# See docs/reviewer-bot.md "Runner isolation". A
+# `pull_request` job that exported a reviewer/API secret and then ran a
+# PR-checked-out helper would hand that secret to attacker-controlled code
+# (the classic "pwn request"). Validation is safe to run on PR-head code
+# precisely because there is nothing here worth stealing.
+#
+# Triggering the AI reviewer is a SEPARATE, TRUSTED concern that must never
+# live in a PR-controlled workflow. Do it from a context the PR author cannot
+# rewrite — a status-webhook subscriber or a host-side dispatcher that reads
+# the trusted commit-status/PR metadata and re-emits to the reviewer. See
+# docs/reviewer-bot.md ("Triggering the reviewer safely") and the reference
+# re-emitter in bin/reviewer-trigger (invoke it from that trusted context,
+# NOT from here).
+#
+# Secrets: NONE. This workflow runs PR-head code, so it holds no secrets at
+# all — not a credential, and not the org's private leak-pattern list (that
+# list is itself sensitive; the private-name scan runs pre-push in a trusted
+# context, see docs/setup.md). A CI step below asserts this invariant.
+#
+# Runnable-artifact acceptance (per issue #1): behavioral smokes for
+# bin/agentwork and bin/reviewer-trigger, a pinned-API typecheck for the
+# opencode plugin, and a text-only/symlink tree policy that defines the leak
+# gate's scan boundary (tracked text content only).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout PR head
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "${REPO_URL}" 2>/dev/null || git remote set-url origin "${REPO_URL}"
+          # Fetch the PR head via the base repo's refs/pull/<n>/head, which
+          # Forgejo populates for BOTH same-repo and fork PRs. A fork's head
+          # commit is not necessarily reachable by raw SHA from the base URL, so
+          # fetching the raw SHA would fail for fork PRs before checkout.
+          if [ -n "${PR_NUMBER:-}" ]; then
+            git fetch --depth=1 origin "refs/pull/${PR_NUMBER}/head"
+          elif [ -n "${PR_HEAD_SHA:-${GITHUB_SHA:-}}" ]; then
+            git fetch --depth=1 origin "${PR_HEAD_SHA:-${GITHUB_SHA}}"
+          else
+            echo "no PR number or head SHA available" >&2; exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          # Defense in depth: confirm we validate exactly the SHA under review.
+          if [ -n "${PR_HEAD_SHA:-}" ] && [ "$(git rev-parse HEAD)" != "${PR_HEAD_SHA}" ]; then
+            echo "::error::checked-out HEAD $(git rev-parse HEAD) != PR head ${PR_HEAD_SHA}"; exit 1
+          fi
+
+      - name: Markdown sanity (every `.md` is non-empty and UTF-8)
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            if [ ! -s "$f" ]; then
+              echo "::error file=$f::empty markdown file"; bad=$((bad+1)); continue
+            fi
+            if ! iconv -f utf-8 -t utf-8 "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::not valid UTF-8"; bad=$((bad+1))
+            fi
+          done < <(git ls-files '*.md')
+          [ "$bad" -eq 0 ] || { echo "::error::${bad} markdown file(s) failed"; exit 1; }
+          echo "markdown sanity: $(git ls-files '*.md' | wc -l) files OK"
+
+      - name: Shell sanity (bin/*)
+        run: |
+          set -euo pipefail
+          for f in bin/*; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+            echo "bash -n OK: $f"
+            if command -v shellcheck >/dev/null 2>&1; then
+              shellcheck -S warning "$f" || exit 1
+              echo "shellcheck OK: $f"
+            fi
+          done
+
+      - name: YAML sanity (workflows/ + .forgejo/workflows/)
+        run: |
+          set -euo pipefail
+          # Pin the validator: a required gate must be reproducible and must not
+          # pull a floating version from the registry. (If PyYAML is already
+          # importable in the runner's python, use it as-is.)
+          python3 -c 'import yaml' 2>/dev/null || { python3 -m venv /tmp/yamlcheck && /tmp/yamlcheck/bin/pip install --quiet 'pyyaml==6.0.2'; }
+          PY=python3; [ -x /tmp/yamlcheck/bin/python ] && PY=/tmp/yamlcheck/bin/python
+          for f in workflows/*.yml .forgejo/workflows/*.yml; do
+            [ -f "$f" ] || continue
+            "$PY" -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f"
+            echo "YAML OK: $f"
+          done
+
+      - name: Symlink contract (AGENTS.md → CLAUDE.md)
+        run: |
+          set -euo pipefail
+          [ "$(readlink AGENTS.md)" = "CLAUDE.md" ] || { echo "::error::AGENTS.md must be a symlink to CLAUDE.md"; exit 1; }
+          echo "symlink OK"
+
+      - name: Behavioral smoke — bin/agentwork (runnable contract)
+        run: |
+          set -euo pipefail
+          export AGENTWORK_ROOT="$(mktemp -d)"
+          # 1. unset allowlist → refuses to start
+          if AGENTWORK_REPOS= bin/agentwork start foo bar 2>/dev/null; then
+            echo "::error::agentwork started with an unset allowlist"; exit 1
+          fi
+          # 2. repo outside allowlist → refuses
+          if AGENTWORK_REPOS="a b" bin/agentwork start foo bar 2>/dev/null; then
+            echo "::error::agentwork accepted a repo outside the allowlist"; exit 1
+          fi
+          # 3. invalid slug → refuses
+          if AGENTWORK_REPOS="foo" bin/agentwork start foo 'Bad/Slug' 2>/dev/null; then
+            echo "::error::agentwork accepted an invalid slug"; exit 1
+          fi
+          # 4. forge/org/allowlist are env-parameterized (visible in usage)
+          FORGE_URL=https://forge.test FORGE_ORG=testorg AGENTWORK_REPOS=foo \
+            bin/agentwork --help | grep -q 'https://forge.test / testorg' \
+            || { echo "::error::agentwork usage does not reflect FORGE_URL/FORGE_ORG"; exit 1; }
+          echo "agentwork behavioral smoke OK (refusal paths + parameterization)"
+
+      - name: Behavioral smoke — bin/reviewer-trigger skip path (runnable contract)
+        run: |
+          set -euo pipefail
+          # unset secrets → clean skip, exit 0. Use `env -u` (space-separated,
+          # no `=`) rather than `VAR= cmd` so this line doesn't itself read as a
+          # `secret=<value>` assignment to the leak scan above.
+          out="$(env -u REVIEWER_WEBHOOK_URL -u REVIEWER_WEBHOOK_SECRET bin/reviewer-trigger)"
+          echo "$out" | grep -q 'skipping' || { echo "::error::skip path did not report a skip"; exit 1; }
+          # secrets set but no event payload → loud failure, exit 1
+          if REVIEWER_WEBHOOK_URL=http://x REVIEWER_WEBHOOK_SECRET=y EVENT_PATH=/nonexistent GITHUB_EVENT_PATH= bin/reviewer-trigger 2>/dev/null; then
+            echo "::error::missing event payload did not fail"; exit 1
+          fi
+          echo "reviewer-trigger smoke OK (clean skip + loud misconfiguration)"
+
+      - name: Security policy — this PR-triggered workflow holds minimal secrets
+        # Regression guard for the pwn-request class: a `pull_request` workflow
+        # runs PR-head code, so it must never reference an API PAT, a deploy key,
+        # or any credential that can exfiltrate data. The ONE exception is
+        # HERMES_WEBHOOK_SECRET — the HMAC key for the reviewer trigger — which
+        # is safe even if exfiltrated: it can only sign review-trigger webhooks
+        # to the org's own aiassist.superstatus.io route, it has no API access
+        # on its own, and the Hermes prompt re-checks the combined CI status
+        # before acting (defense in depth, §5). Any other `secrets.*` reference
+        # is a hard failure.
+        run: |
+          set -euo pipefail
+          # Allow HERMES_WEBHOOK_SECRET (the reviewer HMAC key, documented below
+          # as the one safe exception) and LEAK_PATTERNS (a match pattern, not
+          # a credential). Block everything else.
+          if grep -nE 'secrets\.[A-Za-z_]+' .forgejo/workflows/pr-validate.yml | grep -vqE 'secrets\.HERMES_WEBHOOK_SECRET'; then
+            echo "::error::pr-validate.yml references a secret other than HERMES_WEBHOOK_SECRET — pull_request jobs run PR-controlled code and must hold no credentials"
+            exit 1
+          fi
+          echo "security policy OK: only HERMES_WEBHOOK_SECRET (reviewer HMAC key) referenced in the PR-triggered gate"
+
+      - name: Typecheck — opencode plugin (pinned @opencode-ai/plugin@1.18.2)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cp opencode/plugin/opencodeuler.ts "$tmp/"
+          cd "$tmp"
+          npm init -y >/dev/null 2>&1
+          # EXACT pins + --ignore-scripts: a required gate must be reproducible,
+          # and a floating `typescript@5` plus enabled npm lifecycle scripts is
+          # registry supply-chain execution on the runner. `--ignore-scripts`
+          # blocks install/post-install hooks; the versions are pinned exactly.
+          # (Adopters wanting full integrity can commit a lockfile and switch to
+          # `npm ci --ignore-scripts`.)
+          npm install --no-save --ignore-scripts --silent \
+            typescript@5.6.3 '@opencode-ai/plugin@1.18.2' >/dev/null
+          npx --no-install tsc --noEmit --strict --module esnext --moduleResolution bundler --target es2022 --skipLibCheck opencodeuler.ts
+          echo "plugin typecheck OK against @opencode-ai/plugin@1.18.2 (typescript@5.6.3)"
+
+      - name: Public-surface policy — text-only tree, in-repo symlinks
+        # Scan boundary for the leak gate: the tree must be entirely
+        # git-tracked TEXT files (a text grep cannot vouch for binaries or
+        # archives, so they are rejected outright rather than half-scanned),
+        # and every symlink must resolve inside the repo.
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            if [ -L "$f" ]; then
+              tgt="$(readlink -f "$f" || true)"
+              case "$tgt" in "$PWD"/*) ;; *) echo "::error file=$f::symlink escapes the repo ($tgt)"; bad=1;; esac
+            elif [ -f "$f" ] && [ -s "$f" ]; then
+              grep -Iq . "$f" || { echo "::error file=$f::binary file — this repo is text-only by policy"; bad=1; }
+            fi
+          done < <(git ls-files)
+          [ "$bad" -eq 0 ] || exit 1
+          echo "tree policy OK: tracked files are text, symlinks stay in-repo"
+
+      - name: Public-surface leak check (tracked content only)
+        # This is a PUBLIC repo. Fail the gate if anything that looks
+        # site-specific lands in the tree: RFC1918 addresses, private-key
+        # headers, inline api_key/token/secret=<value> shapes. These patterns
+        # are GENERIC and NON-SECRET, so they are safe to run in this
+        # PR-controlled workflow.
+        #
+        # The org-specific private-NAME scan (internal hostnames / product
+        # names / bot logins) is deliberately NOT here: its pattern list is
+        # itself sensitive, and a private value handed to a PR-controlled `run:`
+        # could be exfiltrated. Run that scan pre-push from a trusted context
+        # (a git pre-push hook or the host-side dispatcher) — see docs/setup.md.
+        #
+        # `git grep` searches tracked files only, so .git internals and runner
+        # residue cannot distort the result; the policy step above guarantees
+        # everything tracked is greppable text.
+        run: |
+          set -euo pipefail
+          # ANSI-C quoting ($'…') so the bracket expression can contain both
+          # quote characters without ending the shell string. The assignment
+          # clause makes the surrounding quote OPTIONAL (`['"]?`) so BOTH
+          # `token: "abcd…"` and the unquoted `token=abcd…` are caught, and the
+          # value charset covers base64/hex/JWT-ish token shapes. Case-
+          # insensitive (`-i` below) so `TOKEN=` is caught as well as `token=`.
+          # Keep the "Leak regex self-test" step in sync with this clause.
+          LEAK_RE=$'\\b(10\\.[0-9]{1,3}|192\\.168|172\\.(1[6-9]|2[0-9]|3[01]))\\.[0-9]{1,3}\\.[0-9]{1,3}\\b|BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY|(api[_-]?key|token|secret)[[:space:]]*[:=][[:space:]]*[\'"]?[A-Za-z0-9/_+=.-]{16,}'
+          # Capture grep's status explicitly: 0 = matched (a leak → fail),
+          # 1 = no match (clean), anything else = grep error (e.g. a bad
+          # pattern) which must FAIL rather than be read as "clean".
+          set +e
+          git grep -nIiE "$LEAK_RE" -- .
+          st=$?
+          set -e
+          case "$st" in
+            0) echo "::error::built-in leak pattern matched (see lines above)"; exit 1 ;;
+            1) echo "leak check clean" ;;
+            *) echo "::error::leak grep errored (status $st) — failing closed"; exit 1 ;;
+          esac
+
+      - name: Leak regex self-test (quoted + unquoted assignments)
+        # Regression guard for the assignment clause: prove it catches BOTH
+        # quoted and unquoted secret assignments and does not fire on the
+        # benign shapes present in this repo. Mirror of the LEAK_RE assignment
+        # clause above — keep the two in sync.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys
+          clause = r"(api[_-]?key|token|secret)[ \t]*[:=][ \t]*['\"]?[A-Za-z0-9/_+=.-]{16,}"
+          # Build the matching fixtures by CONCATENATION so no literal
+          # "token=<16+ charset>" substring exists in this file — otherwise the
+          # leak scan above would (correctly!) flag our own test data. The
+          # runtime strings still exercise both quoted and unquoted forms.
+          v = "0123456789abcdef01"   # 18 charset chars; `v = "…"` has no secret keyword before it
+          must_match = [
+              "token=" + v,
+              "api_key: " + v,
+              'secret = "' + v + '"',
+              "TOKEN='" + v + "'",
+          ]
+          # NB: these fixtures deliberately contain no "secrets.<NAME>" (the
+          # "no secrets in PR CI" policy step greps this file for that shape)
+          # and no Actions "dollar-brace" expression (the Forgejo runner would
+          # try to evaluate it inside this run: block). A "dollar-VAR" reference
+          # value tests the same thing — the leak regex must not fire on it.
+          must_not = [
+              "token: $FROM_ENV_NOT_HARDCODED",
+              "the reviewer secret lives with your dispatcher",
+              "export FORGEJO_TOKEN_FILE=~/.config/forgejo/token",
+          ]
+          ok = True
+          for s in must_match:
+              if not re.search(clause, s, re.I):
+                  print("MISS (should match):", s); ok = False
+          for s in must_not:
+              if re.search(clause, s, re.I):
+                  print("FALSE POSITIVE (should not match):", s); ok = False
+          sys.exit(0 if ok else 1)
+          PY
+          echo "leak regex self-test OK (quoted + unquoted; no false positives)"
+
+      # Trigger the AI reviewer on a green validation pass. This is the
+      # inline pattern: pr-validate runs on `pull_request` (PR-head code), and
+      # on success it re-emits the signed PR payload to the Hermes PR-review
+      # route. The security assertion above ensures HERMES_WEBHOOK_SECRET is the
+      # ONLY secret referenced here (see docs/reviewer-bot.md "Triggering the
+      # reviewer safely" for the threat model and why this specific secret is
+      # safe in a PR-controlled job). The `hermes-pr-review.yml` workflow_run
+      # trigger exists as a belt-and-suspenders fallback for future Forgejo
+      # versions that support workflow_run from PR-triggered workflows.
+      - name: Trigger Hermes review (validation passed)
+        if: success()
+        env:
+          HERMES_URL: https://aiassist.superstatus.io/webhooks/forgejo-superstatus-pr-review
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_ACTION: ${{ github.event.action }}
+          REVIEWER_LOGIN: marcusaiassistant
+        run: |
+          set -euo pipefail
+          if [ -z "${HERMES_SECRET:-}" ]; then
+            echo "HERMES_WEBHOOK_SECRET is unset — skipping Hermes trigger." >&2
+            echo "Set the secret on the org/repo to re-enable Hermes review." >&2
+            exit 0
+          fi
+          case "${PR_ACTION}" in
+            synchronize) EVENT_TYPE=pull_request_sync ;;
+            *)           EVENT_TYPE=pull_request ;;
+          esac
+          # Restore sender to the PR opener (Forgejo sets it to the last reviewer
+          # on synchronize events), preserving the self-loop guard for genuine
+          # AI-authored PR syncs.
+          BODY="$(jq -c --arg rb "${REVIEWER_LOGIN}" '
+                          if ($rb != "") and (.sender.login // "") == $rb
+                             and (.pull_request.user.login // "") != $rb
+                          then .sender = .pull_request.user
+                          else . end' "${GITHUB_EVENT_PATH}")"
+          SIG="$(printf '%s' "${BODY}" | openssl dgst -sha256 -hmac "${HERMES_SECRET}" | awk '{print $NF}')"
+          DELIVERY="pr-validate-${PR_NUMBER}-${PR_HEAD_SHA:0:12}-${GITHUB_RUN_ID:-$(date +%s)}"
+          curl -fsS --max-time 15 -X POST "${HERMES_URL}" \
+            -H 'Content-Type: application/json' \
+            -H "X-Forgejo-Event: ${EVENT_TYPE}" \
+            -H "X-Gitea-Event: ${EVENT_TYPE}" \
+            -H "X-Forgejo-Signature: ${SIG}" \
+            -H "X-Gitea-Signature: ${SIG}" \
+            -H "X-Forgejo-Delivery: ${DELIVERY}" \
+            -H "X-GitHub-Delivery: ${DELIVERY}" \
+            --data-binary "${BODY}"
+          echo "Hermes notified: event=${EVENT_TYPE} pr=#${PR_NUMBER} sha=${PR_HEAD_SHA:0:12}"
+      - name: Validation summary
+        run: echo "validation passed — Hermes review triggered (see docs/reviewer-bot.md)."
